@@ -37,6 +37,11 @@
   let answerDelay = 0;
   let destroyed = false;
   const fflags = { fish: false, random: false, cont: false, reveal: false, skip: false };
+  const gflags = { random: false, cont: false };
+  let lobbyBusy = false;
+  let fakeOn = false;
+  const fakeAdded = new Set();
+  const armedSell = { kind: null, until: 0 };
   let lastFish = 0;
   let onlineType = null;
   let lastReveal = 0;
@@ -563,6 +568,265 @@
     if (badge.textContent !== text) badge.textContent = text;
   };
 
+  const PROTECTED_RARITIES = ["Legendary", "Chroma", "Mystical", "Unique"];
+  const SELL_ACTION_ID = "504d5bfe3d4b01def79630a2138ec4f50f85bee9";
+  const BUY_PACK_ACTION_ID = "07f506cbf77b3c76f2fe32f5e1ef295935f4c113";
+
+  const webpackRequire = () => {
+    const chunk = window.webpackChunk_N_E;
+    if (!chunk || typeof chunk.push !== "function") return null;
+    let req = null;
+    try {
+      chunk.push([[Symbol("blookjs")], {}, r => {
+        req = r;
+      }]);
+    } catch (error) {
+      return null;
+    }
+    return req;
+  };
+
+  const findCallServer = () => {
+    const req = webpackRequire();
+    if (!req || !req.c) return null;
+    for (const id of Object.keys(req.c)) {
+      let fn = null;
+      try {
+        const entry = req.c[id];
+        fn = entry && entry.exports && entry.exports.callServer;
+      } catch (error) {
+        fn = null;
+      }
+      if (typeof fn === "function") return fn;
+    }
+    return null;
+  };
+
+  const runAction = async (id, fields) => {
+    const callServer = findCallServer();
+    if (!callServer) throw new Error("page runtime not found - open the Market or Blooks page");
+    const form = new FormData();
+    Object.keys(fields).forEach(key => form.append(key, fields[key]));
+    return callServer(id, [{ message: "", status: "idle" }, form]);
+  };
+
+  const readActionResult = result => {
+    if (!result || typeof result !== "object") return { ok: false, error: "no response from the server" };
+    let data = null;
+    if (typeof result.message === "string") {
+      try {
+        data = JSON.parse(result.message);
+      } catch (error) {
+        data = null;
+      }
+    }
+    if (result.error || result.status === "error") {
+      return { ok: false, error: String(result.error || result.message || "the server rejected the request") };
+    }
+    if (data && typeof data === "object") return { ok: true, data };
+    return { ok: false, error: String(result.message || result.status || "unexpected response") };
+  };
+
+  const lobbyLock = async run => {
+    if (lobbyBusy) return { ok: false, error: "another Lobby action is still running" };
+    lobbyBusy = true;
+    try {
+      return await run();
+    } catch (error) {
+      return { ok: false, error: error && error.message ? error.message : String(error) };
+    } finally {
+      lobbyBusy = false;
+    }
+  };
+
+  const marketState = () => {
+    let found = null;
+    walk(props => {
+      if (props && Array.isArray(props.packs) && typeof props.setUserTokens === "function" && "userTokens" in props) {
+        found = props;
+        return true;
+      }
+      return false;
+    });
+    return found;
+  };
+
+  const packKey = name => String(name || "").trim().toLowerCase().replace(/\s*pack$/, "");
+
+  const findPack = (state, wanted) => state.packs.find(p => packKey(p.name) === packKey(wanted)) || null;
+
+  const buyPacks = async (packName, amountRaw, report) => {
+    const state = marketState();
+    if (!state) return { ok: false, error: "open the Market page first" };
+    if (!String(packName || "").trim()) return { ok: false, error: "type a pack name" };
+    const pack = findPack(state, packName);
+    if (!pack) {
+      return { ok: false, error: 'no pack named "' + String(packName).trim() + '" - available: ' + state.packs.map(p => p.name).join(", ") };
+    }
+    const amount = Math.floor(Number(amountRaw));
+    if (!Number.isFinite(amount) || amount < 1) return { ok: false, error: "amount must be 1 or more" };
+    if (typeof state.userTokens !== "number") return { ok: false, error: "token balance has not loaded yet" };
+    const cost = pack.price * amount;
+    if (cost > state.userTokens) {
+      return { ok: false, error: "need " + cost.toLocaleString() + " tokens for " + amount + " x " + pack.name + ", you have " + state.userTokens.toLocaleString() };
+    }
+    let remaining = amount;
+    let bought = 0;
+    let opened = 0;
+    let fresh = 0;
+    let left = state.userTokens;
+    while (remaining > 0) {
+      const chunk = Math.min(remaining, 100);
+      const result = await runAction(BUY_PACK_ACTION_ID, {
+        itemId: pack.packId,
+        quantity: String(chunk),
+        shopItem: JSON.stringify({ name: pack.name, price: pack.price, itemId: pack.packId }),
+      });
+      const parsed = readActionResult(result);
+      if (!parsed.ok) return { ok: false, error: parsed.error, pack: pack.name, bought, opened, fresh, tokensLeft: left };
+      const info = Array.isArray(parsed.data.purchaseInfo) ? parsed.data.purchaseInfo : [];
+      opened += info.length;
+      fresh += info.filter(i => i && i.isNewToUser).length;
+      const rest = parseInt(parsed.data.remainingTokens, 10);
+      if (Number.isFinite(rest)) {
+        left = rest;
+        const live = marketState();
+        if (live) live.setUserTokens(rest);
+      }
+      bought += chunk;
+      remaining -= chunk;
+      if (report) report("Bought " + bought + " of " + amount + "...");
+    }
+    return { ok: true, pack: pack.name, bought, opened, fresh, tokensLeft: left };
+  };
+
+  const blooksState = () => {
+    let found = null;
+    walk(props => {
+      if (props && Array.isArray(props.userBlooks) && typeof props.setUserBlooks === "function" && Array.isArray(props.packs)) {
+        found = props;
+        return true;
+      }
+      return false;
+    });
+    return found;
+  };
+
+  const blookCatalog = state => {
+    const map = new Map();
+    const add = pack => (pack && pack.blooks ? pack.blooks : []).forEach(b => {
+      if (b && b.name && !map.has(b.name)) map.set(b.name, b);
+    });
+    state.packs.forEach(add);
+    (state.freePacks || []).forEach(add);
+    return map;
+  };
+
+  const isFakeEntry = entry => fakeAdded.has(entry.blook) && entry.quantity === 1 && entry.sellPrice === 0;
+
+  const sellPlan = kind => {
+    const state = blooksState();
+    if (!state) return { ok: false, error: "open the Blooks page first" };
+    const catalog = blookCatalog(state);
+    const items = [];
+    state.userBlooks.forEach(entry => {
+      if (isFakeEntry(entry)) return;
+      const meta = catalog.get(entry.blook);
+      const rarity = meta && meta.rarity;
+      if (!rarity) return;
+      const owned = Number(entry.quantity) || 0;
+      let sell = 0;
+      if (kind === "duplicates") sell = PROTECTED_RARITIES.includes(rarity) ? 0 : owned - 1;
+      else if (kind === "commons") sell = rarity === "Common" ? owned : 0;
+      else if (kind === "uncommons") sell = rarity === "Common" || rarity === "Uncommon" ? owned : 0;
+      if (sell > 0) items.push({ name: entry.blook, rarity, quantity: sell, owned, last: sell >= owned, price: Number(entry.sellPrice) || 0 });
+    });
+    return {
+      ok: true,
+      kind,
+      items,
+      copies: items.reduce((sum, i) => sum + i.quantity, 0),
+      tokens: items.reduce((sum, i) => sum + i.quantity * i.price, 0),
+    };
+  };
+
+  const sellBlooks = async (kind, report) => {
+    const plan = sellPlan(kind);
+    if (!plan.ok) return plan;
+    if (!plan.items.length) return { ok: true, kinds: 0, copies: 0, tokens: null };
+    let copies = 0;
+    let kinds = 0;
+    let tokens = null;
+    for (const item of plan.items) {
+      const fields = { blook: item.name, quantity: String(item.quantity) };
+      if (item.last) fields.confirm = item.name;
+      const result = await runAction(SELL_ACTION_ID, fields);
+      const parsed = readActionResult(result);
+      if (!parsed.ok) return { ok: false, error: item.name + ": " + parsed.error, kinds, copies, tokens };
+      const remaining = parseInt(parsed.data.remainingQuantity, 10);
+      const rest = parseInt(parsed.data.tokens, 10);
+      copies += item.quantity;
+      kinds += 1;
+      if (Number.isFinite(rest)) tokens = rest;
+      const live = blooksState();
+      if (live && Number.isFinite(remaining)) {
+        live.setUserBlooks(list => {
+          const others = list.filter(e => e.blook !== item.name);
+          return remaining === 0 ? others : [...others, { blook: item.name, quantity: remaining, sellPrice: item.price }];
+        });
+        if (Number.isFinite(rest) && typeof live.setUserTokens === "function") live.setUserTokens(rest);
+      }
+      if (report) report("Sold " + kinds + " of " + plan.items.length + " blooks...");
+      await sleep(120);
+    }
+    return { ok: true, kinds, copies, tokens };
+  };
+
+  const askSell = (kind, label, report) => {
+    const plan = sellPlan(kind);
+    if (!plan.ok) return Promise.resolve("Not sold: " + plan.error);
+    if (!plan.items.length) return Promise.resolve("Nothing to sell (" + label + ")");
+    const now = Date.now();
+    if (armedSell.kind !== kind || now > armedSell.until) {
+      armedSell.kind = kind;
+      armedSell.until = now + 6000;
+      return Promise.resolve("Sell " + plan.copies + " copies of " + plan.items.length + " blooks (" + label + ") for about " + plan.tokens.toLocaleString() + " tokens? Press again within 6 seconds to confirm");
+    }
+    armedSell.kind = null;
+    return lobbyLock(() => sellBlooks(kind, report)).then(r => {
+      if (!r.ok) return "Stopped: " + r.error + (r.copies ? " (sold " + r.copies + " copies first)" : "");
+      return "Sold " + r.copies + " copies of " + r.kinds + " blooks" + (r.tokens !== null ? " - " + r.tokens.toLocaleString() + " tokens now" : "");
+    });
+  };
+
+  const setFakeUnlock = enabled => {
+    const state = blooksState();
+    if (!state) return { ok: false, error: "open the Blooks page first" };
+    if (enabled) {
+      const catalog = blookCatalog(state);
+      const owned = new Set(state.userBlooks.map(e => e.blook));
+      const added = [];
+      catalog.forEach((meta, name) => {
+        if (!owned.has(name)) added.push({ blook: name, quantity: 1, sellPrice: 0 });
+      });
+      added.forEach(e => fakeAdded.add(e.blook));
+      state.setUserBlooks(list => [...list, ...added.filter(e => !list.some(x => x.blook === e.blook))]);
+      fakeOn = true;
+      return { ok: true, enabled: true, added: added.length };
+    }
+    const names = new Set(fakeAdded);
+    state.setUserBlooks(list => list.filter(e => !(names.has(e.blook) && e.quantity === 1 && e.sellPrice === 0)));
+    fakeAdded.clear();
+    fakeOn = false;
+    return { ok: true, enabled: false };
+  };
+
+  const setGeneralFlag = (name, enabled) => {
+    gflags[name] = Boolean(enabled);
+    syncLoop();
+    return gflags[name];
+  };
+
   const minutesBox = () => document.getElementById("number");
 
   const findMinutesMenu = () => {
@@ -783,8 +1047,8 @@
   const tickAuto = () => {
     const player = me();
     if (player) tickPrizes(player);
-    if (flags.random || cflags.random || fflags.random) randomAnswerTick();
-    if (flags.cont || cflags.cont || fflags.cont) continueTick();
+    if (flags.random || cflags.random || fflags.random || gflags.random) randomAnswerTick();
+    if (flags.cont || cflags.cont || fflags.cont || gflags.cont) continueTick();
     if (fflags.fish) fishTick();
     if (fflags.reveal) fishRevealTick();
     if (fflags.skip) fishSkipTick();
@@ -793,12 +1057,13 @@
   const syncLoop = () => {
     const needed = flags.skip || flags.prize || flags.random || flags.cont
       || cflags.skip || cflags.prize || cflags.random || cflags.cont
-      || fflags.fish || fflags.random || fflags.cont || fflags.reveal || fflags.skip;
-    if (!flags.random && !cflags.random && !fflags.random) {
+      || fflags.fish || fflags.random || fflags.cont || fflags.reveal || fflags.skip
+      || gflags.random || gflags.cont;
+    if (!flags.random && !cflags.random && !fflags.random && !gflags.random) {
       answered = null;
       seenQuestion = null;
     }
-    if (!flags.cont && !cflags.cont && !fflags.cont) contState = null;
+    if (!flags.cont && !cflags.cont && !fflags.cont && !gflags.cont) contState = null;
     if (!fflags.fish) lastPress = null;
     if (needed && !timers.loop) timers.loop = setInterval(tickAuto, 25);
     if (!needed && timers.loop) {
@@ -873,7 +1138,7 @@
   };
 
   const api = {
-    version: "0.11.0",
+    version: "0.12.0",
     crypto: {
       getPrize: () => lastPrize,
       reveal: () => {
@@ -1015,6 +1280,42 @@
       },
       pickTarget: userId => send("swapOrTake", { targetUserId: userId }),
     },
+    general: {
+      randomAnswer: (enabled = true, delayMs) => {
+        if (typeof delayMs === "number") answerDelay = Math.max(0, delayMs);
+        return setGeneralFlag("random", enabled);
+      },
+      autoContinue: (enabled = true) => setGeneralFlag("cont", enabled),
+      status: () => ({ random: gflags.random, cont: gflags.cont }),
+    },
+    lobby: {
+      packs: () => {
+        const st = marketState();
+        return st ? st.packs.map(p => ({ name: p.name, price: p.price, packId: p.packId })) : [];
+      },
+      tokens: () => {
+        const st = marketState();
+        return st && typeof st.userTokens === "number" ? st.userTokens : null;
+      },
+      buyPacks: (pack, amount) => lobbyLock(() => buyPacks(pack, amount)),
+      blooks: () => {
+        const st = blooksState();
+        if (!st) return [];
+        const catalog = blookCatalog(st);
+        return st.userBlooks.filter(e => !isFakeEntry(e)).map(e => ({
+          name: e.blook,
+          quantity: e.quantity,
+          sellPrice: e.sellPrice,
+          rarity: catalog.get(e.blook) ? catalog.get(e.blook).rarity : null,
+        }));
+      },
+      planSell: kind => sellPlan(kind),
+      sellDuplicates: () => lobbyLock(() => sellBlooks("duplicates")),
+      sellCommons: () => lobbyLock(() => sellBlooks("commons")),
+      sellUncommonsAndBelow: () => lobbyLock(() => sellBlooks("uncommons")),
+      unlockAll: (enabled = true) => setFakeUnlock(Boolean(enabled)),
+      fakeUnlocked: () => fakeOn,
+    },
     fish: {
       getState: fishState,
       getStage: () => {
@@ -1047,7 +1348,6 @@
       dualMode: (enabled = true) => {
         const on = Boolean(enabled);
         fflags.fish = on;
-        fflags.cont = on;
         setFishFlag("skip", on);
         return fishStatus();
       },
@@ -1081,6 +1381,7 @@
       fontFaces = [];
       removeMinutesGuard();
       if (unlimitedMinutes) setTimeLimitRemoved(false);
+      if (fakeOn) setFakeUnlock(false);
       if (menuHost) menuHost.remove();
       menuHost = null;
       document.querySelectorAll("[data-blookjs]").forEach(node => node.remove());
@@ -1101,7 +1402,7 @@
     .icon-btn { display: grid; place-items: center; width: 36px; height: 36px; border: 0; border-radius: 8px; background: #118891; color: #fafafa; cursor: pointer; }
     .main { flex: 1; min-height: 0; display: grid; grid-template-columns: 140px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); grid-template-areas: "tabs content" "status content"; gap: 12px 18px; padding: 14px 16px 14px 14px; }
     .tabs { grid-area: tabs; display: flex; flex-direction: column; gap: 10px; }
-    .tab { min-height: 62px; padding: 10px 12px; border: 0; border-bottom: 4px solid rgba(0, 0, 0, 0.28); border-radius: 10px; background: #27272a; color: #a1a1aa; font-size: 15px; font-weight: 800; white-space: nowrap; cursor: pointer; }
+    .tab { min-height: 40px; padding: 8px 12px; border: 0; border-bottom: 4px solid rgba(0, 0, 0, 0.28); border-radius: 10px; background: #27272a; color: #a1a1aa; font-size: 15px; font-weight: 800; white-space: nowrap; cursor: pointer; }
     .tab:hover { color: #fafafa; }
     .tab:active { transform: translateY(2px); border-bottom-width: 2px; }
     .tab[aria-selected="true"] { background: #0bc2cf; color: #ffffff; }
@@ -1111,6 +1412,11 @@
     .body > .section:nth-child(1) { grid-column: 1; grid-row: 1 / span 2; }
     .body > .section:nth-child(2) { grid-column: 2; grid-row: 1; }
     .body > .section:nth-child(3) { grid-column: 2; grid-row: 2; }
+    .body.two > .section:nth-child(2) { grid-column: 2; grid-row: 1 / span 2; }
+    .field { width: 100%; min-height: 40px; margin: 0 0 8px; padding: 8px 12px; border: 2px solid #27272a; border-radius: 8px; background: #09090b; color: #fafafa; font-size: 14px; font-weight: 700; outline: none; }
+    .field::placeholder { color: #71717a; font-weight: 600; }
+    .field:focus { border-color: #0bc2cf; }
+    .buttons.stack { grid-template-columns: minmax(0, 1fr); }
     .section-head { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 30px; padding: 4px 2px; background: none; border: 0; color: #fafafa; font-size: 12px; font-weight: 800; letter-spacing: 0.8px; text-transform: uppercase; cursor: pointer; }
     .chev { display: grid; place-items: center; color: #a1a1aa; transition: transform 0.15s; }
     .section-head[aria-expanded="false"] .chev { transform: rotate(-90deg); }
@@ -1144,8 +1450,10 @@
     @media (max-width: 700px) {
       .panel { height: min(560px, calc(100vh - 24px)); height: min(560px, calc(100dvh - 24px)); }
       .main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; grid-template-areas: "tabs" "content" "status"; gap: 10px; padding: 12px; }
-      .tabs { flex-direction: row; gap: 8px; }
-      .tab { flex: 1; min-height: 44px; padding: 8px 4px; font-size: 12.5px; }
+      .tabs { flex-direction: row; gap: 8px; overflow-x: auto; scrollbar-width: none; }
+      .tab { flex: 0 0 auto; min-height: 44px; padding: 8px 14px; font-size: 13px; }
+      .field { font-size: 16px; }
+      .body.two > .section:nth-child(2) { grid-column: 1; grid-row: auto; }
       .body { grid-template-columns: minmax(0, 1fr); }
       .body > .section:nth-child(1), .body > .section:nth-child(2), .body > .section:nth-child(3) { grid-column: 1; grid-row: auto; }
       .status { align-self: auto; min-height: 44px; max-height: 84px; }
@@ -1228,8 +1536,8 @@
       sw.setAttribute("aria-label", label);
       const sync = () => sw.setAttribute("aria-checked", String(Boolean(get())));
       sw.addEventListener("click", () => {
-        set(!get());
-        setStatus(label + (get() ? " on" : " off"));
+        const message = set(!get());
+        setStatus(typeof message === "string" ? message : label + (get() ? " on" : " off"));
         refresh();
       });
       row.append(text, sw);
@@ -1315,8 +1623,6 @@
         toggleRow("Auto Reveal", "Show prize on the pumpkins", () => questAuto, v => api.quest.autoReveal(v)),
         toggleRow("Auto Skip", "Skip losses and Nothing", () => flags.skip, v => api.quest.autoSkip(v)),
         toggleRow("Auto Prize", "Pick first pumpkin and claim", () => flags.prize, v => api.quest.autoPrize(v)),
-        toggleRow("Random Answer", "Answer questions at random", () => flags.random, v => api.quest.randomAnswer(v)),
-        toggleRow("Auto Continue", "Press continue for you", () => flags.cont, v => api.quest.autoContinue(v)),
       ]),
       section("Status", [
         infoList([
@@ -1362,8 +1668,6 @@
         toggleRow("Auto Reveal", "Show prize on the boxes", () => auto, v => api.crypto.autoReveal(v)),
         toggleRow("Auto Skip", "Skip Nothing prizes", () => cflags.skip, v => api.crypto.autoSkip(v)),
         toggleRow("Auto Prize", "Claim prizes automatically", () => cflags.prize, v => api.crypto.autoPrize(v)),
-        toggleRow("Random Answer", "Answer questions at random", () => cflags.random, v => api.crypto.randomAnswer(v)),
-        toggleRow("Auto Continue", "Press continue for you", () => cflags.cont, v => api.crypto.autoContinue(v)),
       ]),
       section("Status", [
         infoList([
@@ -1419,12 +1723,10 @@
     );
     fishPane.append(
       section("Automation", [
-        toggleRow("Dual Mode", "Auto skip, auto fish and auto continue", () => fflags.fish && fflags.cont && fflags.skip, v => api.fish.dualMode(v)),
+        toggleRow("Dual Mode", "Auto skip and auto fish", () => fflags.fish && fflags.skip, v => api.fish.dualMode(v)),
         toggleRow("Auto Reveal", "Show the next catch (online)", () => fflags.reveal, v => api.fish.autoReveal(v)),
         toggleRow("Auto Skip", "Hide distractions (online)", () => fflags.skip, v => api.fish.autoSkip(v)),
         toggleRow("Auto Fish", "Cast, reel and claim for you", () => fflags.fish, v => api.fish.autoFish(v)),
-        toggleRow("Random Answer", "Answer questions at random", () => fflags.random, v => api.fish.randomAnswer(v)),
-        toggleRow("Auto Continue", "Press continue for you", () => fflags.cont, v => api.fish.autoContinue(v)),
       ]),
       section("Status", [
         infoList([
@@ -1447,7 +1749,94 @@
       section("Actions", [fishButtons]),
     );
 
-    const panes = { quest: questPane, crypto: cryptoPane, fish: fishPane };
+    const field = (placeholder, mode) => {
+      const input = el("input", "field");
+      input.type = "text";
+      input.placeholder = placeholder;
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      if (mode) input.inputMode = mode;
+      ["keydown", "keyup", "keypress"].forEach(type => input.addEventListener(type, event => event.stopPropagation()));
+      return input;
+    };
+
+    const generalPane = el("div", "body two");
+    generalPane.append(
+      section("Automation", [
+        toggleRow("Random Answer", "Works in any game mode", () => gflags.random, v => api.general.randomAnswer(v)),
+        toggleRow("Auto Continue", "Press continue for you", () => gflags.cont, v => api.general.autoContinue(v)),
+      ]),
+      section("Status", [
+        infoList([
+          ["Game", () => {
+            const t = document.title.replace(/\s*\|\s*Blooket.*$/i, "").trim();
+            return { text: t || "-" };
+          }],
+          ["Question", () => {
+            const info = readQuestion();
+            if (!info) return { text: "-", tone: "muted" };
+            return { text: info.done ? "Answered" : info.choices.length + " choices", tone: info.done ? "muted" : "good" };
+          }],
+        ]),
+      ]),
+    );
+
+    const packInput = field("Robot Pack (Pack Name)");
+    const amountInput = field("5 (Amount)", "numeric");
+    const buyButtons = el("div", "buttons stack");
+    buyButtons.append(
+      actionButton("Buy", "green", async () => {
+        const result = await lobbyLock(() => buyPacks(packInput.value, amountInput.value, setStatus));
+        if (!result.ok) {
+          return "Not bought: " + result.error + (result.bought ? " (bought " + result.bought + " first)" : "");
+        }
+        return "Bought " + result.bought + " x " + result.pack + " - " + result.opened + " blooks (" + result.fresh + " new), " + result.tokensLeft.toLocaleString() + " tokens left";
+      }),
+    );
+    const sellButtons = el("div", "buttons stack");
+    sellButtons.append(
+      actionButton("Sell Duplicates", "red", () => askSell("duplicates", "duplicates, keeping one of each", setStatus)),
+      actionButton("Sell Commons", "red", () => askSell("commons", "all commons", setStatus)),
+      actionButton("Sell Uncommons and Below", "red", () => askSell("uncommons", "all uncommons and commons", setStatus)),
+    );
+    const lobbyPane = el("div", "body two");
+    lobbyPane.append(
+      section("Batch Buy", [
+        packInput,
+        amountInput,
+        infoList([
+          ["Tokens", () => {
+            const st = marketState();
+            return { text: st && typeof st.userTokens === "number" ? st.userTokens.toLocaleString() : "-" };
+          }],
+          ["Pack", () => {
+            const st = marketState();
+            if (!packInput.value.trim()) return { text: "-", tone: "muted" };
+            const pack = st ? findPack(st, packInput.value) : null;
+            return pack ? { text: pack.name + " - " + pack.price.toLocaleString(), tone: "good" } : { text: "not found", tone: "bad" };
+          }],
+          ["Total", () => {
+            const st = marketState();
+            const pack = st && packInput.value.trim() ? findPack(st, packInput.value) : null;
+            const amount = Math.floor(Number(amountInput.value));
+            if (!pack || !Number.isFinite(amount) || amount < 1) return { text: "-", tone: "muted" };
+            const total = pack.price * amount;
+            return { text: total.toLocaleString(), tone: typeof st.userTokens === "number" && total > st.userTokens ? "bad" : "good" };
+          }],
+        ]),
+        buyButtons,
+      ]),
+      section("Blooks", [
+        toggleRow("Unlock All (fake)", "Display only, the server still knows what you own", () => fakeOn, v => {
+          const result = setFakeUnlock(v);
+          if (!result.ok) return "Not changed: " + result.error;
+          return result.enabled ? "Showing all " + result.added + " blooks you do not own as unlocked (display only)" : "Unlock All (fake) off";
+        }),
+        sellButtons,
+      ]),
+    );
+
+    const panes = { general: generalPane, lobby: lobbyPane, quest: questPane, crypto: cryptoPane, fish: fishPane };
     const tabs = el("div", "tabs");
     tabs.setAttribute("role", "tablist");
     tabs.setAttribute("aria-orientation", "vertical");
@@ -1458,7 +1847,7 @@
         tabButtons[key].setAttribute("aria-selected", String(key === name));
       });
     };
-    [["quest", "Gold Quest"], ["crypto", "Crypto Hack"], ["fish", "Fishing Frenzy"]].forEach(([key, label]) => {
+    [["general", "General"], ["lobby", "Lobby"], ["quest", "Gold Quest"], ["crypto", "Crypto Hack"], ["fish", "Fishing Frenzy"]].forEach(([key, label]) => {
       const tab = el("button", "tab", label);
       tab.type = "button";
       tab.setAttribute("role", "tab");
@@ -1466,10 +1855,15 @@
       tabButtons[key] = tab;
       tabs.append(tab);
     });
-    select(/fishing/i.test(document.title) ? "fish" : /crypto/i.test(document.title) ? "crypto" : "quest");
+    const pathName = String(window.location && window.location.pathname || "");
+    select(/\/(market|blooks)(\/|$)/i.test(pathName) ? "lobby"
+      : /fishing/i.test(document.title) ? "fish"
+      : /crypto/i.test(document.title) ? "crypto"
+      : /quest/i.test(document.title) ? "quest"
+      : "general");
 
     const content = el("div", "content");
-    content.append(questPane, cryptoPane, fishPane);
+    content.append(generalPane, lobbyPane, questPane, cryptoPane, fishPane);
     const main = el("div", "main");
     main.append(tabs, content, status);
     panel.append(head, main);
