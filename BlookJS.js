@@ -40,7 +40,8 @@
   const gflags = { random: false, cont: false };
   let lobbyBusy = false;
   let fakeOn = false;
-  const fakeAdded = new Set();
+  const fakeAdded = new Map();
+  let lastActionVia = "";
   const armedSell = { kind: null, until: 0 };
   let lastFish = 0;
   let onlineType = null;
@@ -572,42 +573,109 @@
   const SELL_ACTION_ID = "504d5bfe3d4b01def79630a2138ec4f50f85bee9";
   const BUY_PACK_ACTION_ID = "07f506cbf77b3c76f2fe32f5e1ef295935f4c113";
 
-  const webpackRequire = () => {
-    const chunk = window.webpackChunk_N_E;
-    if (!chunk || typeof chunk.push !== "function") return null;
-    let req = null;
-    try {
-      chunk.push([[Symbol("blookjs")], {}, r => {
-        req = r;
-      }]);
-    } catch (error) {
-      return null;
-    }
-    return req;
+  const webpackRequires = () => {
+    const out = [];
+    Object.keys(window).filter(k => k.startsWith("webpackChunk")).forEach(k => {
+      const chunk = window[k];
+      if (!chunk || typeof chunk.push !== "function") return;
+      try {
+        chunk.push([[Symbol("blookjs")], {}, r => {
+          out.push(r);
+        }]);
+      } catch (error) {
+        return;
+      }
+    });
+    return out;
   };
 
   const findCallServer = () => {
-    const req = webpackRequire();
-    if (!req || !req.c) return null;
-    for (const id of Object.keys(req.c)) {
-      let fn = null;
-      try {
-        const entry = req.c[id];
-        fn = entry && entry.exports && entry.exports.callServer;
-      } catch (error) {
-        fn = null;
+    const info = { globals: Object.keys(window).filter(k => k.startsWith("webpackChunk")), requires: 0, cached: 0, fn: null };
+    for (const req of webpackRequires()) {
+      info.requires += 1;
+      const cache = req.c || {};
+      for (const id of Object.keys(cache)) {
+        info.cached += 1;
+        let fn = null;
+        try {
+          const entry = cache[id];
+          fn = entry && entry.exports && entry.exports.callServer;
+        } catch (error) {
+          fn = null;
+        }
+        if (typeof fn === "function") {
+          info.fn = fn;
+          return info;
+        }
       }
-      if (typeof fn === "function") return fn;
+      const factories = req.m || {};
+      for (const id of Object.keys(factories)) {
+        let text = "";
+        try {
+          text = String(factories[id]);
+        } catch (error) {
+          text = "";
+        }
+        if (text.indexOf("getServerActionDispatcher") === -1 || text.indexOf("callServer") === -1) continue;
+        try {
+          const mod = req(id);
+          if (mod && typeof mod.callServer === "function") {
+            info.fn = mod.callServer;
+            return info;
+          }
+        } catch (error) {
+          continue;
+        }
+      }
     }
-    return null;
+    return info;
+  };
+
+  const fetchAction = async (id, fields) => {
+    const body = new FormData();
+    body.append("0", JSON.stringify([{ message: "", status: "idle" }, "$K1"]));
+    Object.keys(fields).forEach(key => body.append("1_" + key, fields[key]));
+    const response = await fetch(window.location.pathname + window.location.search, {
+      method: "POST",
+      headers: { Accept: "text/x-component", "Next-Action": id },
+      body,
+      credentials: "same-origin",
+    });
+    const text = await response.text();
+    const chunks = {};
+    text.split("\n").forEach(line => {
+      const match = /^([0-9a-f]+):(.*)$/.exec(line);
+      if (match) chunks[match[1]] = match[2];
+    });
+    if (!Object.keys(chunks).length) throw new Error("server action request failed (HTTP " + response.status + ")");
+    let root = null;
+    try {
+      root = JSON.parse(chunks["0"] || "null");
+    } catch (error) {
+      root = null;
+    }
+    const ref = root && typeof root.a === "string" ? root.a.replace(/^\$@?/, "") : "1";
+    const raw = chunks[ref];
+    if (raw === undefined) throw new Error("unexpected server response (HTTP " + response.status + ")");
+    if (raw.charAt(0) === "E") throw new Error("the server threw an error (HTTP " + response.status + ")");
+    const value = JSON.parse(raw);
+    return typeof value === "string" ? null : value;
   };
 
   const runAction = async (id, fields) => {
-    const callServer = findCallServer();
-    if (!callServer) throw new Error("page runtime not found - open the Market or Blooks page");
-    const form = new FormData();
-    Object.keys(fields).forEach(key => form.append(key, fields[key]));
-    return callServer(id, [{ message: "", status: "idle" }, form]);
+    const info = findCallServer();
+    if (info.fn) {
+      const form = new FormData();
+      Object.keys(fields).forEach(key => form.append(key, fields[key]));
+      try {
+        lastActionVia = "callServer";
+        return await info.fn(id, [{ message: "", status: "idle" }, form]);
+      } catch (error) {
+        if (!/dispatcher/i.test(String(error && error.message))) throw error;
+      }
+    }
+    lastActionVia = "fetch";
+    return fetchAction(id, fields);
   };
 
   const readActionResult = result => {
@@ -722,7 +790,7 @@
     return map;
   };
 
-  const isFakeEntry = entry => fakeAdded.has(entry.blook) && entry.quantity === 1 && entry.sellPrice === 0;
+  const isFakeEntry = entry => fakeAdded.has(entry.blook) && entry.quantity === 1 && entry.sellPrice === fakeAdded.get(entry.blook);
 
   const sellPlan = kind => {
     const state = blooksState();
@@ -790,7 +858,7 @@
     if (armedSell.kind !== kind || now > armedSell.until) {
       armedSell.kind = kind;
       armedSell.until = now + 6000;
-      return Promise.resolve("Sell " + plan.copies + " copies of " + plan.items.length + " blooks (" + label + ") for about " + plan.tokens.toLocaleString() + " tokens? Press again within 6 seconds to confirm");
+      return Promise.resolve("Press again to confirm (6 sec)");
     }
     armedSell.kind = null;
     return lobbyLock(() => sellBlooks(kind, report)).then(r => {
@@ -799,23 +867,52 @@
     });
   };
 
+  const FAKE_PRICES = { Common: 5, Uncommon: 20, Rare: 75, Epic: 350, Legendary: 1500, Chroma: 5000, Mystical: 10000, Unique: 20000 };
+
+  const userBlooksSetter = state => {
+    let setter = null;
+    walk((props, fiber) => {
+      if (props && Array.isArray(props.unlockedBlooks) && Array.isArray(props.modifiedPacks) && fiber.memoizedState) {
+        let hook = fiber.memoizedState;
+        while (hook) {
+          if (Array.isArray(hook.memoizedState) && hook.memoizedState === state.userBlooks && hook.queue && typeof hook.queue.dispatch === "function") {
+            setter = hook.queue.dispatch;
+            break;
+          }
+          hook = hook.next;
+        }
+        return true;
+      }
+      return false;
+    });
+    return setter || state.setUserBlooks;
+  };
+
   const setFakeUnlock = enabled => {
     const state = blooksState();
     if (!state) return { ok: false, error: "open the Blooks page first" };
+    const set = userBlooksSetter(state);
     if (enabled) {
       const catalog = blookCatalog(state);
       const owned = new Set(state.userBlooks.map(e => e.blook));
+      const realPrice = {};
+      state.userBlooks.forEach(e => {
+        const meta = catalog.get(e.blook);
+        if (meta && meta.rarity && e.sellPrice > 0 && realPrice[meta.rarity] === undefined) realPrice[meta.rarity] = e.sellPrice;
+      });
       const added = [];
       catalog.forEach((meta, name) => {
-        if (!owned.has(name)) added.push({ blook: name, quantity: 1, sellPrice: 0 });
+        if (owned.has(name)) return;
+        const price = realPrice[meta.rarity] !== undefined ? realPrice[meta.rarity] : (FAKE_PRICES[meta.rarity] || 0);
+        added.push({ blook: name, quantity: 1, sellPrice: price });
       });
-      added.forEach(e => fakeAdded.add(e.blook));
-      state.setUserBlooks(list => [...list, ...added.filter(e => !list.some(x => x.blook === e.blook))]);
+      added.forEach(e => fakeAdded.set(e.blook, e.sellPrice));
+      set(list => [...list, ...added.filter(e => !list.some(x => x.blook === e.blook))]);
       fakeOn = true;
       return { ok: true, enabled: true, added: added.length };
     }
-    const names = new Set(fakeAdded);
-    state.setUserBlooks(list => list.filter(e => !(names.has(e.blook) && e.quantity === 1 && e.sellPrice === 0)));
+    const names = new Map(fakeAdded);
+    set(list => list.filter(e => !(names.has(e.blook) && e.quantity === 1 && e.sellPrice === names.get(e.blook))));
     fakeAdded.clear();
     fakeOn = false;
     return { ok: true, enabled: false };
@@ -924,7 +1021,7 @@
     if (!lastPrize) return { sent: false, reason: "no prize yet" };
     if (player.defensiveHackType) return { sent: false, reason: "you are being hacked" };
     const prize = lastPrize;
-    const skipHack = prize.type === "hack";
+    const skipHack = false;
     const sent = send("claimPrize", { skipHack });
     if (sent) cryptoFresh = false;
     return { sent, prize, skipHack, reason: sent ? undefined : "not in a game" };
@@ -1005,7 +1102,7 @@
     if (!prev || (now - prev.at >= 2000 && prev.sends < 3)) {
       cryptoAttempt = { kind: "claim", at: now, sends: prev ? prev.sends + 1 : 1 };
       setTimeout(() => {
-        if (lastPrize === prize && cryptoFresh) send("claimPrize", { skipHack: prize.type === "hack" });
+        if (lastPrize === prize && cryptoFresh) send("claimPrize", { skipHack: false });
       }, prizeDelay);
     }
   };
@@ -1023,7 +1120,7 @@
       }
       return;
     }
-    if (!flags.prize) return;
+    if (!flags.prize || prize.type === "swap") return;
     const prev = prizeAttempt && prizeAttempt.kind === "pick" ? prizeAttempt : null;
     if (!prev || (now - prev.at >= 2000 && prev.sends < 3)) {
       prizeAttempt = { kind: "pick", at: now, sends: prev ? prev.sends + 1 : 1 };
@@ -1138,7 +1235,7 @@
   };
 
   const api = {
-    version: "0.12.0",
+    version: "0.12.1",
     crypto: {
       getPrize: () => lastPrize,
       reveal: () => {
@@ -1315,6 +1412,10 @@
       sellUncommonsAndBelow: () => lobbyLock(() => sellBlooks("uncommons")),
       unlockAll: (enabled = true) => setFakeUnlock(Boolean(enabled)),
       fakeUnlocked: () => fakeOn,
+      diagnose: () => {
+        const info = findCallServer();
+        return { path: window.location.pathname, webpackGlobals: info.globals, runtimes: info.requires, cachedModules: info.cached, callServerFound: Boolean(info.fn), lastActionVia, marketPage: Boolean(marketState()), blooksPage: Boolean(blooksState()) };
+      },
     },
     fish: {
       getState: fishState,
