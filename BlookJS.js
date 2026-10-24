@@ -42,6 +42,7 @@
   let fakeOn = false;
   const fakeAdded = new Map();
   let lastActionVia = "";
+  let fakeTimer = null;
   const armedSell = { kind: null, until: 0 };
   let lastFish = 0;
   let onlineType = null;
@@ -867,6 +868,29 @@
     });
   };
 
+  const syncCardQuantities = list => {
+    const byName = new Map(list.map(e => [e.blook, e.quantity]));
+    walk((props, fiber) => {
+      const blook = props && props.blook;
+      if (blook && typeof blook === "object" && typeof blook.name === "string" && "rarity" in blook && typeof props.setUserBlooks === "function" && fiber.memoizedState) {
+        let hook = fiber.memoizedState;
+        for (let i = 0; i < 2 && hook; i += 1) hook = hook.next;
+        if (hook && typeof hook.memoizedState === "number" && hook.queue && typeof hook.queue.dispatch === "function") {
+          const target = byName.has(blook.name) ? byName.get(blook.name) : 0;
+          if (hook.memoizedState !== target) hook.queue.dispatch(target);
+        }
+      }
+      return false;
+    });
+  };
+
+  const scheduleCardSync = list => {
+    syncCardQuantities(list);
+    [150, 600].forEach(ms => setTimeout(() => {
+      if (!destroyed) syncCardQuantities(list);
+    }, ms));
+  };
+
   const FAKE_PRICES = { Common: 5, Uncommon: 20, Rare: 75, Epic: 350, Legendary: 1500, Chroma: 5000, Mystical: 10000, Unique: 20000 };
 
   const userBlooksSetter = state => {
@@ -908,11 +932,22 @@
       });
       added.forEach(e => fakeAdded.set(e.blook, e.sellPrice));
       set(list => [...list, ...added.filter(e => !list.some(x => x.blook === e.blook))]);
+      scheduleCardSync([...state.userBlooks, ...added.filter(e => !state.userBlooks.some(x => x.blook === e.blook))]);
+      if (!fakeTimer) {
+        fakeTimer = setInterval(() => {
+          const live = blooksState();
+          if (live) syncCardQuantities(live.userBlooks);
+        }, 800);
+      }
       fakeOn = true;
       return { ok: true, enabled: true, added: added.length };
     }
     const names = new Map(fakeAdded);
-    set(list => list.filter(e => !(names.has(e.blook) && e.quantity === 1 && e.sellPrice === names.get(e.blook))));
+    const isFake = e => names.has(e.blook) && e.quantity === 1 && e.sellPrice === names.get(e.blook);
+    set(list => list.filter(e => !isFake(e)));
+    clearInterval(fakeTimer);
+    fakeTimer = null;
+    scheduleCardSync(state.userBlooks.filter(e => !isFake(e)));
     fakeAdded.clear();
     fakeOn = false;
     return { ok: true, enabled: false };
@@ -1235,7 +1270,7 @@
   };
 
   const api = {
-    version: "0.12.1",
+    version: "0.12.2",
     crypto: {
       getPrize: () => lastPrize,
       reveal: () => {
