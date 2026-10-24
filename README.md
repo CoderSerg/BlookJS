@@ -9,6 +9,11 @@ and lobby inventory actions.
 > affect other players' experience. Use at your own discretion. Features
 > can break when Blooket changes its website.
 
+## Changelog
+### v0.12.2
+Fixes:
+- Fix blook quantity showing 0 when using "Unlock All"
+
 ## Features
 
 -   Floating, draggable control panel with minimize, restore, and close
