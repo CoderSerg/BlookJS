@@ -10,7 +10,7 @@ and lobby inventory actions.
 > can break when Blooket changes its website.
 
 ## Changelog
-### v0.12.2
+### v0.13
 Additions:
 - Cafe support
 - Adding commands to README later
