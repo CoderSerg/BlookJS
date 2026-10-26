@@ -43,6 +43,10 @@
   const fakeAdded = new Map();
   let lastActionVia = "";
   let fakeTimer = null;
+  const kflags = { serve: false, ask: false };
+  let lastCafe = 0;
+  let lastAsk = 0;
+  const lastServe = new Map();
   const armedSell = { kind: null, until: 0 };
   let lastFish = 0;
   let onlineType = null;
@@ -953,6 +957,67 @@
     return { ok: true, enabled: false };
   };
 
+  const isCafePlayer = p => Boolean(p) && Boolean(p.foods) && Boolean(p.customers);
+
+  const pendingOrder = customer => {
+    if (!customer || customer.hasPaid || !customer.order || !customer.order.lines) return false;
+    return mapValues(customer.order.lines).some(quantity => Number(quantity) > 0);
+  };
+
+  const mapValues = collection => {
+    const out = [];
+    if (collection && typeof collection.forEach === "function") collection.forEach(value => out.push(value));
+    return out;
+  };
+
+  const cafeState = () => {
+    const player = me();
+    if (!isCafePlayer(player)) return null;
+    const foods = mapValues(player.foods);
+    const customers = mapValues(player.customers).filter(pendingOrder);
+    return {
+      money: Number(player.score) || 0,
+      level: player.cafeLevel,
+      customers: customers.length,
+      stock: foods.reduce((sum, f) => sum + (Number(f.quantity) || 0), 0),
+      busySeconds: Math.max(0, Math.ceil(Number(player.remainingInspectionTime) || 0)),
+      inQuestion: Boolean(player.inQuestion),
+      inTutorial: Boolean(player.inTutorial),
+    };
+  };
+
+  const serveCustomers = player => {
+    const now = Date.now();
+    let sent = 0;
+    mapValues(player.customers).forEach(customer => {
+      if (!pendingOrder(customer)) return;
+      if (now - (lastServe.get(customer.id) || 0) < 450) return;
+      lastServe.set(customer.id, now);
+      if (send("playerPlaceCustomerOrder", { customer })) sent += 1;
+    });
+    return sent;
+  };
+
+  const askQuestion = () => send("playerPromptQuestion", {});
+
+  const tickCafe = player => {
+    const now = Date.now();
+    if (now - lastCafe < 120) return;
+    lastCafe = now;
+    if (!isCafePlayer(player) || player.inTutorial || Number(player.remainingInspectionTime) > 0) return;
+    if (kflags.serve) serveCustomers(player);
+    if (kflags.ask && !player.inQuestion && now - lastAsk > 700) {
+      lastAsk = now;
+      askQuestion();
+    }
+  };
+
+  const setCafeFlag = (name, enabled) => {
+    kflags[name] = Boolean(enabled);
+    syncLoop();
+    return kflags[name];
+  };
+
   const setGeneralFlag = (name, enabled) => {
     gflags[name] = Boolean(enabled);
     syncLoop();
@@ -1179,6 +1244,7 @@
   const tickAuto = () => {
     const player = me();
     if (player) tickPrizes(player);
+    if (player && (kflags.serve || kflags.ask)) tickCafe(player);
     if (flags.random || cflags.random || fflags.random || gflags.random) randomAnswerTick();
     if (flags.cont || cflags.cont || fflags.cont || gflags.cont) continueTick();
     if (fflags.fish) fishTick();
@@ -1190,7 +1256,7 @@
     const needed = flags.skip || flags.prize || flags.random || flags.cont
       || cflags.skip || cflags.prize || cflags.random || cflags.cont
       || fflags.fish || fflags.random || fflags.cont || fflags.reveal || fflags.skip
-      || gflags.random || gflags.cont;
+      || gflags.random || gflags.cont || kflags.serve || kflags.ask;
     if (!flags.random && !cflags.random && !fflags.random && !gflags.random) {
       answered = null;
       seenQuestion = null;
@@ -1270,7 +1336,7 @@
   };
 
   const api = {
-    version: "0.12.2",
+    version: "0.13.0",
     crypto: {
       getPrize: () => lastPrize,
       reveal: () => {
@@ -1412,6 +1478,23 @@
       },
       pickTarget: userId => send("swapOrTake", { targetUserId: userId }),
     },
+    cafe: {
+      getState: cafeState,
+      serveAll: () => {
+        const player = me();
+        return isCafePlayer(player) ? serveCustomers(player) : 0;
+      },
+      askQuestion,
+      autoServe: (enabled = true) => setCafeFlag("serve", enabled),
+      autoAsk: (enabled = true) => setCafeFlag("ask", enabled),
+      dualMode: (enabled = true) => {
+        kflags.serve = Boolean(enabled);
+        kflags.ask = Boolean(enabled);
+        syncLoop();
+        return { serve: kflags.serve, ask: kflags.ask };
+      },
+      status: () => ({ serve: kflags.serve, ask: kflags.ask }),
+    },
     general: {
       randomAnswer: (enabled = true, delayMs) => {
         if (typeof delayMs === "number") answerDelay = Math.max(0, delayMs);
@@ -1537,8 +1620,8 @@
     .controls { display: flex; gap: 8px; }
     .icon-btn { display: grid; place-items: center; width: 36px; height: 36px; border: 0; border-radius: 8px; background: #118891; color: #fafafa; cursor: pointer; }
     .main { flex: 1; min-height: 0; display: grid; grid-template-columns: 140px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); grid-template-areas: "tabs content" "status content"; gap: 12px 18px; padding: 14px 16px 14px 14px; }
-    .tabs { grid-area: tabs; display: flex; flex-direction: column; gap: 10px; }
-    .tab { min-height: 40px; padding: 8px 12px; border: 0; border-bottom: 4px solid rgba(0, 0, 0, 0.28); border-radius: 10px; background: #27272a; color: #a1a1aa; font-size: 15px; font-weight: 800; white-space: nowrap; cursor: pointer; }
+    .tabs { grid-area: tabs; display: flex; flex-direction: column; gap: 6px; }
+    .tab { min-height: 36px; padding: 6px 12px; border: 0; border-bottom: 4px solid rgba(0, 0, 0, 0.28); border-radius: 10px; background: #27272a; color: #a1a1aa; font-size: 15px; font-weight: 800; white-space: nowrap; cursor: pointer; }
     .tab:hover { color: #fafafa; }
     .tab:active { transform: translateY(2px); border-bottom-width: 2px; }
     .tab[aria-selected="true"] { background: #0bc2cf; color: #ffffff; }
@@ -1972,7 +2055,51 @@
       ]),
     );
 
-    const panes = { general: generalPane, lobby: lobbyPane, quest: questPane, crypto: cryptoPane, fish: fishPane };
+    const cafeButtons = el("div", "buttons");
+    cafeButtons.append(
+      actionButton("Serve All", "green", () => {
+        const player = me();
+        if (!isCafePlayer(player)) return "Not in a Cafe game";
+        const n = serveCustomers(player);
+        return n ? "Sent orders for " + n + " customers" : "No customers waiting";
+      }),
+      actionButton("Ask Question", "blue", () => (askQuestion() ? "Asked a question" : "Not in a game")),
+    );
+    const cafePane = el("div", "body");
+    cafePane.append(
+      section("Automation", [
+        toggleRow("Dual Mode", "Auto serve and auto ask", () => kflags.serve && kflags.ask, v => api.cafe.dualMode(v)),
+        toggleRow("Auto Serve", "Serve every customer, no stock check", () => kflags.serve, v => api.cafe.autoServe(v)),
+        toggleRow("Auto Ask", "Ask questions to restock food", () => kflags.ask, v => api.cafe.autoAsk(v)),
+      ]),
+      section("Status", [
+        infoList([
+          ["Money", () => {
+            const st = cafeState();
+            return { text: st ? st.money.toLocaleString() : "-" };
+          }],
+          ["Level", () => {
+            const st = cafeState();
+            return { text: st && st.level !== undefined ? String(st.level) : "-" };
+          }],
+          ["Customers", () => {
+            const st = cafeState();
+            return { text: st ? String(st.customers) : "-" };
+          }],
+          ["Stock", () => {
+            const st = cafeState();
+            return { text: st ? st.stock.toLocaleString() : "-", tone: st && st.stock === 0 ? "bad" : undefined };
+          }],
+          ["Busy", () => {
+            const st = cafeState();
+            return st && st.busySeconds > 0 ? { text: st.busySeconds + "s inspected", tone: "warn" } : { text: "-", tone: "muted" };
+          }],
+        ]),
+      ]),
+      section("Actions", [cafeButtons]),
+    );
+
+    const panes = { general: generalPane, lobby: lobbyPane, quest: questPane, crypto: cryptoPane, fish: fishPane, cafe: cafePane };
     const tabs = el("div", "tabs");
     tabs.setAttribute("role", "tablist");
     tabs.setAttribute("aria-orientation", "vertical");
@@ -1983,7 +2110,7 @@
         tabButtons[key].setAttribute("aria-selected", String(key === name));
       });
     };
-    [["general", "General"], ["lobby", "Lobby"], ["quest", "Gold Quest"], ["crypto", "Crypto Hack"], ["fish", "Fishing Frenzy"]].forEach(([key, label]) => {
+    [["general", "General"], ["lobby", "Lobby"], ["quest", "Gold Quest"], ["crypto", "Crypto Hack"], ["fish", "Fishing Frenzy"], ["cafe", "Cafe"]].forEach(([key, label]) => {
       const tab = el("button", "tab", label);
       tab.type = "button";
       tab.setAttribute("role", "tab");
@@ -1995,11 +2122,12 @@
     select(/\/(market|blooks)(\/|$)/i.test(pathName) ? "lobby"
       : /fishing/i.test(document.title) ? "fish"
       : /crypto/i.test(document.title) ? "crypto"
+      : /cafe/i.test(document.title) ? "cafe"
       : /quest/i.test(document.title) ? "quest"
       : "general");
 
     const content = el("div", "content");
-    content.append(generalPane, lobbyPane, questPane, cryptoPane, fishPane);
+    content.append(generalPane, lobbyPane, questPane, cryptoPane, fishPane, cafePane);
     const main = el("div", "main");
     main.append(tabs, content, status);
     panel.append(head, main);
